@@ -87,6 +87,9 @@ def average_region(data_and_metadata: DataAndMetadata.DataAndMetadata, mask_data
 def resample_image(data_and_metadata: DataAndMetadata.DataAndMetadata, shape: DataAndMetadata.ShapeType) -> DataAndMetadata.DataAndMetadata:
     return Core.function_resample_2d(data_and_metadata, shape)
 
+def rebin_image(data_and_metadata: DataAndMetadata.DataAndMetadata, bin_factor: int) -> DataAndMetadata.DataAndMetadata:
+    return Core.function_rebin_2d(data_and_metadata, bin_factor)
+
 def warp(data_and_metadata: DataAndMetadata.DataAndMetadata, coordinates: typing.Sequence[DataAndMetadata.DataAndMetadata]) -> DataAndMetadata.DataAndMetadata:
     return Core.function_warp(data_and_metadata, coordinates)
 

@@ -1434,6 +1434,20 @@ def function_resample_2d(data_and_metadata: DataAndMetadata.DataAndMetadata, sha
     return DataAndMetadata.new_data_and_metadata(calculate_data(), intensity_calibration=data_and_metadata.intensity_calibration, dimensional_calibrations=resampled_dimensional_calibrations)
 
 
+def function_rebin_2d(data_and_metadata: DataAndMetadata.DataAndMetadata, bin_factor: int) -> DataAndMetadata.DataAndMetadata:
+    data_and_metadata = DataAndMetadata.promote_ndarray(data_and_metadata)
+
+    def rebin(data, bin_factor):
+        binned_shape = (data.shape[0] // bin_factor, data.shape[1] // bin_factor)
+        new_shape = (binned_shape[0], bin_factor, binned_shape[1], bin_factor)
+        cropped_data = data[:binned_shape[0]*bin_factor, :binned_shape[1]*bin_factor]
+        return cropped_data.reshape(new_shape).sum(-1).sum(1)
+
+    new_data = rebin(data_and_metadata.data, bin_factor)
+    dimensional_calibrations = data_and_metadata.dimensional_calibrations
+    rebinned_dimensional_calibrations = [Calibration.Calibration(dimensional_calibrations[i].offset, dimensional_calibrations[i].scale * bin_factor, dimensional_calibrations[i].units) for i in range(len(dimensional_calibrations))]
+    return DataAndMetadata.new_data_and_metadata(new_data, intensity_calibration=data_and_metadata.intensity_calibration, dimensional_calibrations=rebinned_dimensional_calibrations)
+
 def function_warp(data_and_metadata: DataAndMetadata.DataAndMetadata, coordinates: typing.Sequence[DataAndMetadata.DataAndMetadata]) -> DataAndMetadata.DataAndMetadata:
     data_and_metadata = DataAndMetadata.promote_ndarray(data_and_metadata)
     coords = numpy.moveaxis(numpy.dstack([coordinate.data for coordinate in coordinates]), -1, 0)
