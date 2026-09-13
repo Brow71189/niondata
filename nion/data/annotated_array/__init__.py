@@ -6,6 +6,9 @@ Import this package as the single entry point for annotated-array related functi
 """
 
 from .primitives import fft
+from .primitives import gaussian_window
+from .primitives import hamming_window
+from .primitives import hann_window
 from .primitives import ifft
 
 from ._implementation import AffineCalibration
@@ -44,6 +47,9 @@ __all__ = [
     "ValueType",
     "fft",
     "from_data_and_metadata",
+    "gaussian_window",
+    "hamming_window",
+    "hann_window",
     "ifft",
     "infer_value_type",
     "to_data_and_metadata",

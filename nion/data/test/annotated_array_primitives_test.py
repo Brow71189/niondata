@@ -11,6 +11,7 @@ import unittest
 
 import numpy
 import numpy.testing
+import scipy.signal.windows
 
 from nion.data import annotated_array
 from nion.data.annotated_array import primitives
@@ -67,6 +68,54 @@ def _make_2d_array(
     value_type = annotated_array.infer_value_type(data.dtype)
     descriptor = annotated_array.ArrayDescriptor((signal_group,), value_type=value_type)
     return annotated_array.AnnotatedArray(data=data, descriptor=descriptor)
+
+
+def _make_1d_axis_group(
+    size: int,
+    scale: float = 1.0,
+    offset: float = 0.0,
+    unit: str = "",
+) -> annotated_array.AxisGroup:
+    """Return a 1-D AxisGroup, optionally with a single affine spatial calibration.
+
+    A calibration is attached only when a non-default ``scale``, ``offset``, or
+    ``unit`` is given, matching the shape of what a window-generator caller would
+    build for an uncalibrated vs. calibrated source.
+    """
+    if scale == 1.0 and offset == 0.0 and unit == "":
+        return annotated_array.AxisGroup.from_1d_size(size)
+    calibration = annotated_array.CoordinateCalibration(
+        calibrations=(annotated_array.AffineCalibration(scale=scale, offset=offset, unit=unit),)
+    )
+    return annotated_array.AxisGroup.from_1d_size(
+        size,
+        coordinate_calibrations={"spatial": calibration},
+        primary_calibration_key="spatial",
+    )
+
+
+def _make_2d_axis_group(
+    size: tuple[int, int],
+    scale: tuple[float, float] = (1.0, 1.0),
+    unit: str = "",
+) -> annotated_array.AxisGroup:
+    """Return a 2-D AxisGroup, optionally with a single affine spatial calibration.
+
+    A calibration is attached only when a non-default ``scale`` or ``unit`` is given.
+    """
+    if scale == (1.0, 1.0) and unit == "":
+        return annotated_array.AxisGroup.from_2d_size(size)
+    calibration = annotated_array.CoordinateCalibration(
+        calibrations=(
+            annotated_array.AffineCalibration(scale=scale[0], unit=unit),
+            annotated_array.AffineCalibration(scale=scale[1], unit=unit),
+        )
+    )
+    return annotated_array.AxisGroup.from_2d_size(
+        size,
+        coordinate_calibrations={"spatial": calibration},
+        primary_calibration_key="spatial",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +485,216 @@ class TestIfftCalibrationRoundTrip(unittest.TestCase):
         self.assertAlmostEqual(angular_back.scale, 0.1)
         self.assertEqual("nm", spatial_back.unit)
         self.assertEqual("radians", angular_back.unit)
+
+
+# ---------------------------------------------------------------------------
+# Windowing — shared behaviour across gaussian/hamming/hann
+# ---------------------------------------------------------------------------
+
+class TestWindowOutputData(unittest.TestCase):
+
+    def test_gaussian_window_1d_peak_is_at_centre(self) -> None:
+        """A Gaussian window generated for a 1-D axis group must peak at the array centre."""
+        n = 33  # odd length puts an exact centre sample at index n // 2
+        axis_group = _make_1d_axis_group(n)
+        result = primitives.gaussian_window(axis_group, 0.3)
+        data = numpy.asarray(result.data)
+        self.assertEqual(numpy.argmax(data), n // 2)
+
+    def test_gaussian_window_2d_peak_is_at_centre(self) -> None:
+        """A Gaussian window generated for a 2-D axis group must peak at the array centre."""
+        rows, cols = 17, 25
+        axis_group = _make_2d_axis_group((rows, cols))
+        result = primitives.gaussian_window(axis_group, 0.3)
+        data = numpy.asarray(result.data)
+        cy, cx = numpy.unravel_index(numpy.argmax(data), data.shape)
+        self.assertEqual((cy, cx), (rows // 2, cols // 2))
+
+    def test_gaussian_window_non_positive_sigma_does_not_raise(self) -> None:
+        """A non-positive sigma is clamped rather than causing a divide-by-zero error."""
+        axis_group = _make_1d_axis_group(16)
+        result = primitives.gaussian_window(axis_group, 0.0)
+        self.assertFalse(numpy.any(numpy.isnan(numpy.asarray(result.data))))
+
+    def test_gaussian_window_negative_sigma_clamps_same_as_zero(self) -> None:
+        """A negative (non-calibrated) sigma must clamp identically to zero, not produce a wider or inverted window."""
+        axis_group = _make_1d_axis_group(16)
+        zero_result = primitives.gaussian_window(axis_group, 0.0)
+        negative_result = primitives.gaussian_window(axis_group, -0.3)
+        numpy.testing.assert_allclose(
+            numpy.asarray(zero_result.data),
+            numpy.asarray(negative_result.data),
+        )
+
+    def test_hamming_window_1d_tapers_edges_below_centre(self) -> None:
+        """A Hamming window generated for a 1-D axis group must taper the edges below the centre value."""
+        n = 32
+        axis_group = _make_1d_axis_group(n)
+        result = primitives.hamming_window(axis_group)
+        data = numpy.asarray(result.data)
+        self.assertLess(data[0], data[n // 2])
+        self.assertLess(data[-1], data[n // 2])
+
+    def test_hamming_window_2d_is_separable_outer_product(self) -> None:
+        """A 2-D Hamming window must equal the outer product of the two 1-D windows."""
+        rows, cols = 8, 12
+        axis_group = _make_2d_axis_group((rows, cols))
+        result = primitives.hamming_window(axis_group)
+        w0 = numpy.reshape(scipy.signal.windows.hamming(cols), (1, cols))
+        w1 = numpy.reshape(scipy.signal.windows.hamming(rows), (rows, 1))
+        numpy.testing.assert_allclose(numpy.asarray(result.data), w0 * w1)
+
+    def test_hann_window_1d_edges_are_zero(self) -> None:
+        """A Hann window generated for a 1-D axis group must be exactly zero at both edges."""
+        n = 32
+        axis_group = _make_1d_axis_group(n)
+        result = primitives.hann_window(axis_group)
+        data = numpy.asarray(result.data)
+        self.assertAlmostEqual(data[0], 0.0)
+        self.assertAlmostEqual(data[-1], 0.0)
+
+    def test_hann_window_2d_is_separable_outer_product(self) -> None:
+        """A 2-D Hann window must equal the outer product of the two 1-D windows."""
+        rows, cols = 8, 12
+        axis_group = _make_2d_axis_group((rows, cols))
+        result = primitives.hann_window(axis_group)
+        w0 = numpy.reshape(scipy.signal.windows.hann(cols), (1, cols))
+        w1 = numpy.reshape(scipy.signal.windows.hann(rows), (rows, 1))
+        numpy.testing.assert_allclose(numpy.asarray(result.data), w0 * w1)
+
+
+class TestWindowExtentAndCalibration(unittest.TestCase):
+
+    def test_gaussian_window_preserves_shape(self) -> None:
+        axis_group = _make_1d_axis_group(16)
+        result = primitives.gaussian_window(axis_group, 0.3)
+        self.assertEqual(result.descriptor.shape, axis_group.shape)
+
+    def test_hamming_window_preserves_calibration(self) -> None:
+        """A generated window must carry the same coordinate calibration as its axis group."""
+        axis_group = _make_1d_axis_group(16, scale=0.5, unit="nm")
+        result = primitives.hamming_window(axis_group)
+        signal_group = result.descriptor.axis_groups[-1]
+        cal = typing.cast(annotated_array.AffineCalibration, signal_group.get_calibration(0))
+        self.assertAlmostEqual(cal.scale, 0.5)
+        self.assertEqual("nm", cal.unit)
+
+    def test_hann_window_value_type_is_scalar(self) -> None:
+        """A generated window is always a real-valued scalar array, regardless of the eventual target's type."""
+        axis_group = _make_1d_axis_group(16)
+        result = primitives.hann_window(axis_group)
+        self.assertEqual(result.descriptor.value_type, annotated_array.ValueType.SCALAR)
+
+    def test_gaussian_window_has_no_intensity_calibration(self) -> None:
+        """A generated window's values are dimensionless weights, so it must carry no intensity calibration."""
+        axis_group = _make_1d_axis_group(16, scale=0.5, unit="nm")
+        result = primitives.gaussian_window(axis_group, 0.3)
+        self.assertIsNone(result.descriptor.intensity_calibrations.primary_key)
+
+
+class TestWindowInputValidation(unittest.TestCase):
+
+    def test_gaussian_window_rejects_signal_rank_other_than_1_or_2(self) -> None:
+        from nion.data.annotated_array._implementation import Axis
+        signal_group = annotated_array.AxisGroup(axes=(Axis("x", 4), Axis("y", 4), Axis("z", 4)))
+        with self.assertRaises(ValueError):
+            primitives.gaussian_window(signal_group, 0.3)
+
+    def test_hamming_window_rejects_signal_rank_other_than_1_or_2(self) -> None:
+        from nion.data.annotated_array._implementation import Axis
+        signal_group = annotated_array.AxisGroup(axes=(Axis("x", 4), Axis("y", 4), Axis("z", 4)))
+        with self.assertRaises(ValueError):
+            primitives.hamming_window(signal_group)
+
+    def test_hann_window_rejects_signal_rank_other_than_1_or_2(self) -> None:
+        from nion.data.annotated_array._implementation import Axis
+        signal_group = annotated_array.AxisGroup(axes=(Axis("x", 4), Axis("y", 4), Axis("z", 4)))
+        with self.assertRaises(ValueError):
+            primitives.hann_window(signal_group)
+
+
+# ---------------------------------------------------------------------------
+# Gaussian window — calibrated sigma
+# ---------------------------------------------------------------------------
+
+class TestGaussianWindowCalibratedSigma(unittest.TestCase):
+
+    def test_calibrated_1d_matches_equivalent_relative_sigma(self) -> None:
+        """A calibrated sigma must produce the same window as the equivalent pixel-unit relative sigma."""
+        n = 32
+        scale = 0.5  # nm per pixel
+        axis_group = _make_1d_axis_group(n, scale=scale, unit="nm")
+        physical_sigma = 4.0  # nm -> 8 pixels
+        calibrated_result = primitives.gaussian_window(axis_group, physical_sigma, calibrated=True)
+        relative_result = primitives.gaussian_window(axis_group, (physical_sigma / scale) / n, calibrated=False)
+        numpy.testing.assert_allclose(
+            numpy.asarray(calibrated_result.data),
+            numpy.asarray(relative_result.data),
+        )
+
+    def test_calibrated_2d_isotropic_scale_matches_relative_sigma(self) -> None:
+        """With equal per-axis scale, calibrated 2D sigma must match the equivalent relative (circular) window."""
+        rows, cols = 16, 16
+        scale = 0.25  # nm per pixel, same on both axes
+        axis_group = _make_2d_axis_group((rows, cols), scale=(scale, scale), unit="nm")
+        physical_sigma = 1.0  # nm -> 4 pixels on each axis
+        calibrated_result = primitives.gaussian_window(axis_group, physical_sigma, calibrated=True)
+        relative_result = primitives.gaussian_window(axis_group, (physical_sigma / scale) / min(rows, cols), calibrated=False)
+        numpy.testing.assert_allclose(
+            numpy.asarray(calibrated_result.data),
+            numpy.asarray(relative_result.data),
+        )
+
+    def test_calibrated_2d_anisotropic_scale_produces_elliptical_window(self) -> None:
+        """Different per-axis scales under one physical sigma must produce different per-axis pixel widths."""
+        rows, cols = 32, 32
+        axis_group = _make_2d_axis_group((rows, cols), scale=(1.0, 2.0), unit="nm")
+        result = primitives.gaussian_window(axis_group, 4.0, calibrated=True)
+        data = numpy.asarray(result.data)
+        cy, cx = rows // 2, cols // 2
+        # The row axis has a finer scale (1.0 nm/px) than the column axis (2.0 nm/px), so
+        # the same physical sigma spans fewer pixels along columns: the window must fall
+        # off faster moving along a row (varying column index) than moving along a column
+        # (varying row index).
+        self.assertLess(data[cy, cx + 8], data[cy + 8, cx])
+
+    def test_calibrated_non_positive_sigma_clamps_to_one_pixel(self) -> None:
+        """A non-positive physical sigma must clamp to a 1-pixel window, matching the relative-mode clamp.
+
+        In particular, a negative sigma must not be treated as a positive-magnitude
+        standard deviation via ``abs()`` of the pixel conversion -- it must clamp the
+        same way zero does, not silently flip sign.
+        """
+        axis_group = _make_1d_axis_group(16, scale=0.5, unit="nm")
+        zero_result = primitives.gaussian_window(axis_group, 0.0, calibrated=True)
+        negative_result = primitives.gaussian_window(axis_group, -4.0, calibrated=True)
+        numpy.testing.assert_allclose(
+            numpy.asarray(zero_result.data),
+            numpy.asarray(negative_result.data),
+        )
+
+    def test_calibrated_requires_coordinate_calibration(self) -> None:
+        """Calibrated sigma on an uncalibrated axis group must raise ValueError."""
+        axis_group = _make_1d_axis_group(16)  # default scale=1.0, unit="" -> uncalibrated
+        with self.assertRaises(ValueError):
+            primitives.gaussian_window(axis_group, 1.0, calibrated=True)
+
+    def test_calibrated_requires_matching_axis_units(self) -> None:
+        """Calibrated sigma with mismatched per-axis units must raise ValueError."""
+        from nion.data.annotated_array._implementation import Axis
+        calibration = annotated_array.CoordinateCalibration(
+            calibrations=(
+                annotated_array.AffineCalibration(scale=1.0, unit="nm"),
+                annotated_array.AffineCalibration(scale=1.0, unit="1/nm"),
+            )
+        )
+        signal_group = annotated_array.AxisGroup(
+            axes=(Axis("y", 16), Axis("x", 16)),
+            coordinate_calibrations={"spatial": calibration},
+            primary_calibration_key="spatial",
+        )
+        with self.assertRaises(ValueError):
+            primitives.gaussian_window(signal_group, 1.0, calibrated=True)
 
 
 if __name__ == "__main__":

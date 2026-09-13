@@ -13,12 +13,14 @@ import typing
 import numpy
 import numpy.typing
 import scipy.fft
+import scipy.signal.windows
 
 from nion.data.annotated_array._implementation import (
     AffineCalibration,
     AnnotatedArray,
     ArrayDescriptor,
     AxisGroup,
+    Calibration,
     CoordinateCalibration,
     ValueType,
 )
@@ -38,9 +40,8 @@ def _spatial_to_frequency_axis_group(axis_group: AxisGroup) -> AxisGroup:
         offset_freq  = (-0.5 - N // 2) / (s * N)   # DC at centre after fftshift
         unit_freq    = "1/" + u                      # reciprocal unit
 
-    All calibration keys are preserved unchanged (same keys in, same keys out).
-    Each calibration is independently transformed under its original key.
-    The primary calibration key is unchanged.
+    All calibration keys are preserved (same keys in, same keys out), each
+    transformed independently under its original key; the primary key is unchanged.
     """
     def transform_coord_calibration(coord_cal: CoordinateCalibration) -> CoordinateCalibration:
         freq_calibrations: list[AffineCalibration] = []
@@ -78,8 +79,8 @@ def _frequency_to_spatial_axis_group(axis_group: AxisGroup) -> AxisGroup:
         offset_spatial  = 0
         unit_spatial    = u_freq[2:] if u_freq.startswith("1/") else ""
 
-    All calibration keys are preserved unchanged (same keys in, same keys out).
-    The primary calibration key is unchanged.
+    All calibration keys are preserved (same keys in, same keys out); the primary
+    key is unchanged.
     """
     def transform_coord_calibration(coord_cal: CoordinateCalibration) -> CoordinateCalibration:
         spatial_calibrations: list[AffineCalibration] = []
@@ -136,11 +137,10 @@ def fft(array: AnnotatedArray) -> AnnotatedArray:
     Calibration
     ~~~~~~~~~~~
     All calibrations in the signal :class:`AxisGroup` are transformed to the
-    frequency domain. The keys of all calibrations are preserved, so the user-defined
-    calibration names remain unchanged. For example, if the input has calibrations
-    keyed ``"spatial"`` and ``"angular"``, the output will have calibrations keyed
-    ``"spatial"`` and ``"angular"`` (with their scales/offsets/units transformed to
-    frequency). The primary calibration key is also preserved.
+    frequency domain; keys (including the primary key) are preserved. For example,
+    an input with calibrations keyed ``"spatial"`` and ``"angular"`` produces
+    output calibrations under the same two keys, with scales/offsets/units
+    transformed to frequency.
 
     Args:
         array: Input :class:`AnnotatedArray` with a scalar or complex datum.
@@ -219,10 +219,9 @@ def ifft(array: AnnotatedArray) -> AnnotatedArray:
     Calibration round-trip
     ~~~~~~~~~~~~~~~~~~~~~~
     All calibrations in the signal :class:`AxisGroup` are transformed back to the
-    spatial domain. The keys of all calibrations are preserved exactly, so if the
-    frequency-domain array has calibrations keyed ``"spatial"`` and ``"angular"``,
-    the result will also have calibrations with those same keys (now with spatial
-    scales/offsets/units). The primary calibration key is also preserved.
+    spatial domain; keys (including the primary key) are preserved. For example,
+    a frequency-domain array with calibrations keyed ``"spatial"`` and ``"angular"``
+    produces a result with the same two keys, now holding spatial scales/offsets/units.
 
     Args:
         array: :class:`AnnotatedArray` with a complex datum in frequency
@@ -273,3 +272,210 @@ def ifft(array: AnnotatedArray) -> AnnotatedArray:
         value_type=ValueType.COMPLEX,
     )
     return AnnotatedArray(data=result_data, descriptor=new_descriptor, metadata=array.metadata)
+
+
+# ---------------------------------------------------------------------------
+# Windowing
+# ---------------------------------------------------------------------------
+
+def _validate_window_axis_group(name: str, axis_group: AxisGroup) -> int:
+    """Validate that ``axis_group`` is a suitable shape for a window generator.
+
+    Returns the axis group's rank.
+    """
+    rank = axis_group.rank
+    if rank not in (1, 2):
+        raise ValueError(f"{name}: axis group rank must be 1 or 2, got {rank}")
+    return rank
+
+
+def _window_array(axis_group: AxisGroup, data: numpy.typing.NDArray[numpy.float64]) -> AnnotatedArray:
+    """Wrap a real-valued ``data`` array as a standalone window :class:`AnnotatedArray`.
+
+    The window carries ``axis_group`` unchanged, so its coordinate calibration matches
+    whatever data it will later be multiplied into (see `Windowing Generators` in the
+    processing-operations design document). Window values are dimensionless weights, so
+    no intensity calibration is attached.
+    """
+    descriptor = ArrayDescriptor(axis_groups=(axis_group,), value_type=ValueType.SCALAR)
+    return AnnotatedArray(data=data, descriptor=descriptor)
+
+
+def _calibrated_sigma_to_pixels(name: str, axis_group: AxisGroup, sigma: float) -> tuple[float, ...]:
+    """Convert a physical-unit ``sigma`` to one pixel-unit sigma per axis of ``axis_group``.
+
+    Requires a primary coordinate calibration whose axes share one non-empty unit
+    (a single physical value can't be meaningfully split across differing units).
+    Each axis's factor comes from ``calibration.to_index(sigma) - calibration.to_index(0.0)``,
+    which cancels the offset without assuming a concrete implementation such as
+    :class:`AffineCalibration`; this is exact only for an affine (constant-scale)
+    calibration.
+
+    A non-positive ``sigma`` or a non-positive converted result (e.g. a degenerate
+    zero-scale calibration) clamps to ``1.0`` pixel, matching the non-calibrated clamp.
+    """
+    if axis_group.primary_calibration_key is None:
+        raise ValueError(f"{name}: calibrated sigma requires the axis group to have a coordinate calibration")
+
+    calibrations: list[Calibration] = [axis_group.get_calibration(axis_index) for axis_index in range(axis_group.rank)]
+    units = {calibration.unit for calibration in calibrations}
+    if len(units) > 1:
+        raise ValueError(f"{name}: calibrated sigma requires all axes to share the same unit, got {sorted(units)!r}")
+    if not next(iter(units)):
+        raise ValueError(f"{name}: calibrated sigma requires a non-empty calibration unit")
+
+    if sigma <= 0.0:
+        return (1.0,) * axis_group.rank
+
+    pixel_sigmas: list[float] = []
+    for calibration in calibrations:
+        pixel_sigma = abs(calibration.to_index(sigma) - calibration.to_index(0.0))
+        pixel_sigmas.append(pixel_sigma if pixel_sigma > 0.0 else 1.0)
+    return tuple(pixel_sigmas)
+
+
+def gaussian_window(axis_group: AxisGroup, sigma: float, *, calibrated: bool = False) -> AnnotatedArray:
+    """Generate a Gaussian window matching the shape of ``axis_group``.
+
+    Returns the window array standalone (see `Windowing Generators` in the
+    processing-operations design document); combining it with a target array,
+    typically by elementwise multiplication, is up to the caller.
+
+    Relative sigma (``calibrated=False``, the default)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ``sigma`` is a relative standard deviation in ``[0.0, 1.0]``; the absolute
+    standard deviation used to build the window is ``sigma * min(shape)``, where
+    ``shape`` is ``axis_group``'s shape (in pixels). A non-positive ``sigma`` is
+    clamped to ``1.0`` pixel to avoid a divide-by-zero window. This mode is
+    calibration-agnostic: it depends only on the pixel shape.
+
+    Calibrated sigma (``calibrated=True``)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ``sigma`` is a physical-unit standard deviation (e.g. nanometers), converted
+    to pixels independently per axis since axes may have different scales. This
+    generally yields an anisotropic (elliptical) 2D Gaussian rather than the
+    circular window used in relative mode. Requires a primary coordinate
+    calibration whose axes share one non-empty unit.
+
+    2D construction
+    ~~~~~~~~~~~~~~~
+    For a 2D axis group, the window is
+    ``exp(-0.5 * (y**2 / sigma_y**2 + x**2 / sigma_x**2))``, which reduces to the
+    circularly symmetric radial Gaussian when ``sigma_y == sigma_x`` (always true in
+    relative mode; not guaranteed in calibrated mode).
+
+    Args:
+        axis_group: The 1D or 2D :class:`AxisGroup` whose shape (and, in calibrated
+                    mode, calibration) the generated window matches.
+        sigma: Relative standard deviation in ``[0.0, 1.0]`` when ``calibrated`` is
+               ``False``; physical-unit standard deviation when ``calibrated`` is
+               ``True``.
+        calibrated: Whether ``sigma`` is expressed in ``axis_group``'s coordinate
+                    calibration unit rather than as a relative fraction.
+
+    Returns:
+        :class:`AnnotatedArray` with a real scalar datum of ``axis_group``'s shape,
+        carrying ``axis_group`` as its only axis group.
+
+    Raises:
+        ValueError: If ``axis_group``'s rank is not 1 or 2, or if ``calibrated`` is
+                    ``True`` and ``axis_group`` has no calibration or has axes with
+                    differing or empty units.
+    """
+    rank = _validate_window_axis_group("gaussian_window", axis_group)
+    shape = axis_group.shape
+
+    if calibrated:
+        pixel_sigmas = _calibrated_sigma_to_pixels("gaussian_window", axis_group, sigma)
+    else:
+        absolute_sigma = sigma * min(shape)
+        absolute_sigma = absolute_sigma if absolute_sigma > 0.0 else 1.0
+        pixel_sigmas = (absolute_sigma,) * rank
+
+    if rank == 1:
+        data = scipy.signal.windows.gaussian(shape[0], std=pixel_sigmas[0])
+    else:
+        h, w = shape
+        sigma_y, sigma_x = pixel_sigmas
+        y, x = numpy.meshgrid(
+            numpy.arange(0, h) - (h - 1) / 2,
+            numpy.arange(0, w) - (w - 1) / 2,
+            indexing="ij",
+        )
+        data = numpy.exp(-0.5 * ((y * y) / (sigma_y * sigma_y) + (x * x) / (sigma_x * sigma_x)))
+
+    return _window_array(axis_group, data)
+
+
+def hamming_window(axis_group: AxisGroup) -> AnnotatedArray:
+    """Generate a Hamming window matching the shape of ``axis_group``.
+
+    Returns the window array standalone (see `Windowing Generators` in the
+    processing-operations design document); combining it with a target array,
+    typically by elementwise multiplication, is up to the caller.
+
+    2D construction
+    ~~~~~~~~~~~~~~~
+    For a 2D axis group, the window is the separable outer product of two 1D Hamming
+    windows, one per axis.
+
+    Args:
+        axis_group: The 1D or 2D :class:`AxisGroup` whose shape the generated window
+                    matches.
+
+    Returns:
+        :class:`AnnotatedArray` with a real scalar datum of ``axis_group``'s shape,
+        carrying ``axis_group`` as its only axis group.
+
+    Raises:
+        ValueError: If ``axis_group``'s rank is not 1 or 2.
+    """
+    rank = _validate_window_axis_group("hamming_window", axis_group)
+    shape = axis_group.shape
+
+    if rank == 1:
+        data = scipy.signal.windows.hamming(shape[0])
+    else:
+        h, w = shape
+        w0 = numpy.reshape(scipy.signal.windows.hamming(w), (1, w))
+        w1 = numpy.reshape(scipy.signal.windows.hamming(h), (h, 1))
+        data = w0 * w1
+
+    return _window_array(axis_group, data)
+
+
+def hann_window(axis_group: AxisGroup) -> AnnotatedArray:
+    """Generate a Hann window matching the shape of ``axis_group``.
+
+    Returns the window array standalone (see `Windowing Generators` in the
+    processing-operations design document); combining it with a target array,
+    typically by elementwise multiplication, is up to the caller.
+
+    2D construction
+    ~~~~~~~~~~~~~~~
+    For a 2D axis group, the window is the separable outer product of two 1D Hann
+    windows, one per axis.
+
+    Args:
+        axis_group: The 1D or 2D :class:`AxisGroup` whose shape the generated window
+                    matches.
+
+    Returns:
+        :class:`AnnotatedArray` with a real scalar datum of ``axis_group``'s shape,
+        carrying ``axis_group`` as its only axis group.
+
+    Raises:
+        ValueError: If ``axis_group``'s rank is not 1 or 2.
+    """
+    rank = _validate_window_axis_group("hann_window", axis_group)
+    shape = axis_group.shape
+
+    if rank == 1:
+        data = scipy.signal.windows.hann(shape[0])
+    else:
+        h, w = shape
+        w0 = numpy.reshape(scipy.signal.windows.hann(w), (1, w))
+        w1 = numpy.reshape(scipy.signal.windows.hann(h), (h, 1))
+        data = w0 * w1
+
+    return _window_array(axis_group, data)
